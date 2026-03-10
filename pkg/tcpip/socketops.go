@@ -635,6 +635,8 @@ type SockError struct {
 	Dst FullAddress
 	// Offender is the original sender address of the errant packet.
 	Offender FullAddress
+	// ControlSrc is the address of the node that generated the error.
+	ControlSrc FullAddress
 	// NetProto is the network protocol being used to transmit the packet.
 	NetProto NetworkProtocolNumber
 }

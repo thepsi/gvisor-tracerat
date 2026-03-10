@@ -227,6 +227,61 @@ func (*icmpv4FragmentationNeededSockError) Kind() stack.TransportErrorKind {
 	return stack.PacketTooBigTransportError
 }
 
+// icmpv4TimeExceededSockError is a general ICMPv4 Time Exceeded error.
+//
+// +stateify savable
+type icmpv4TimeExceededSockError struct{}
+
+// Origin implements tcpip.SockErrorCause.
+func (*icmpv4TimeExceededSockError) Origin() tcpip.SockErrOrigin {
+	return tcpip.SockExtErrorOriginICMP
+}
+
+// Type implements tcpip.SockErrorCause.
+func (*icmpv4TimeExceededSockError) Type() uint8 {
+	return uint8(header.ICMPv4TimeExceeded)
+}
+
+// Info implements tcpip.SockErrorCause.
+func (*icmpv4TimeExceededSockError) Info() uint32 {
+	return 0
+}
+
+// Kind implements stack.TransportError.
+func (*icmpv4TimeExceededSockError) Kind() stack.TransportErrorKind {
+	return stack.TimeExceededTransportError
+}
+
+var _ stack.TransportError = (*icmpv4TTLExceededSockError)(nil)
+
+// icmpv4TTLExceededSockError is an ICMPv4 Time Exceeded error due to TTL
+// exceeded.
+//
+// +stateify savable
+type icmpv4TTLExceededSockError struct {
+	icmpv4TimeExceededSockError
+}
+
+// Code implements tcpip.SockErrorCause.
+func (*icmpv4TTLExceededSockError) Code() uint8 {
+	return uint8(header.ICMPv4TTLExceeded)
+}
+
+var _ stack.TransportError = (*icmpv4ReassemblyTimeoutSockError)(nil)
+
+// icmpv4ReassemblyTimeoutSockError is an ICMPv4 Time Exceeded error due to
+// reassembly timeout.
+//
+// +stateify savable
+type icmpv4ReassemblyTimeoutSockError struct {
+	icmpv4TimeExceededSockError
+}
+
+// Code implements tcpip.SockErrorCause.
+func (*icmpv4ReassemblyTimeoutSockError) Code() uint8 {
+	return uint8(header.ICMPv4ReassemblyTimeout)
+}
+
 func (e *endpoint) checkLocalAddress(addr tcpip.Address) bool {
 	if e.nic.Spoofing() {
 		return true
@@ -510,6 +565,12 @@ func (e *endpoint) handleICMP(pkt *stack.PacketBuffer) {
 
 	case header.ICMPv4TimeExceeded:
 		received.timeExceeded.Increment()
+		switch h.Code() {
+		case header.ICMPv4TTLExceeded:
+			e.handleControl(&icmpv4TTLExceededSockError{}, pkt)
+		case header.ICMPv4ReassemblyTimeout:
+			e.handleControl(&icmpv4ReassemblyTimeoutSockError{}, pkt)
+		}
 
 	case header.ICMPv4ParamProblem:
 		received.paramProblem.Increment()

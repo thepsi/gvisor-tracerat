@@ -1015,6 +1015,14 @@ const (
 	IPv6MulticastInterfaceOption
 )
 
+// KeepaliveTTLOption is used by SetSockOpt/GetSockOpt to specify the TTL of
+// TCP keepalive packets.
+type KeepaliveTTLOption uint8
+
+func (*KeepaliveTTLOption) isGettableSocketOption() {}
+
+func (*KeepaliveTTLOption) isSettableSocketOption() {}
+
 const (
 	// UseDefaultIPv4TTL is the IPv4TTLOption value that configures an endpoint to
 	// use the default ttl currently configured by the IPv4 protocol (see

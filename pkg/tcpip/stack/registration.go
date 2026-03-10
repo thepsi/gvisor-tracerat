@@ -103,6 +103,10 @@ const (
 	// DestinationHostDownTransportError indicates that the destination host is
 	// down.
 	DestinationHostDownTransportError
+
+	// TimeExceededTransportError indicates that the time to live (or hop limit)
+	// was exceeded in transit or during reassembly.
+	TimeExceededTransportError
 )
 
 // TransportError is a marker interface for errors that may be handled by the

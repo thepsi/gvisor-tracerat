@@ -418,7 +418,7 @@ func (s *sender) updateMaxPayloadSize(mtu, count int) {
 // sendAck sends an ACK segment.
 // +checklocks:s.ep.mu
 func (s *sender) sendAck() {
-	s.sendEmptySegment(header.TCPFlagAck, s.SndNxt)
+	s.sendEmptySegment(header.TCPFlagAck, s.SndNxt, 0)
 }
 
 // updateRTO updates the retransmit timeout when a new roud-trip time is
@@ -1049,7 +1049,7 @@ func (s *sender) postXmit(dataSent bool, shouldScheduleProbe bool) {
 
 	// If we have no more pending data, start the keepalive timer.
 	if s.SndUna == s.SndNxt {
-		s.ep.resetKeepaliveTimer(false)
+		s.ep.resetKeepaliveTimer(false, false)
 	} else {
 		// Enable timers if we have pending data.
 		if shouldScheduleProbe && s.shouldSchedulePTO() {
@@ -1829,12 +1829,11 @@ func (s *sender) sendSegmentFromPacketBuffer(pkt *stack.PacketBuffer, flags head
 	pkt = pkt.Clone()
 	defer pkt.DecRef()
 
-	return s.ep.sendRaw(pkt, flags, seq, rcvNxt, rcvWnd)
+	return s.ep.sendRaw(pkt, flags, seq, rcvNxt, rcvWnd, 0)
 }
 
 // sendEmptySegment sends a new empty segment, flags and sequence number.
-// +checklocks:s.ep.mu
-func (s *sender) sendEmptySegment(flags header.TCPFlags, seq seqnum.Value) tcpip.Error {
+func (s *sender) sendEmptySegment(flags header.TCPFlags, seq seqnum.Value, ttl uint8) tcpip.Error {
 	s.LastSendTime = s.ep.stack.Clock().NowMonotonic()
 	if seq == s.RTTMeasureSeqNum {
 		s.RTTMeasureTime = s.LastSendTime
@@ -1845,7 +1844,7 @@ func (s *sender) sendEmptySegment(flags header.TCPFlags, seq seqnum.Value) tcpip
 	// Remember the max sent ack.
 	s.MaxSentAck = rcvNxt
 
-	return s.ep.sendEmptyRaw(flags, seq, rcvNxt, rcvWnd)
+	return s.ep.sendEmptyRaw(flags, seq, rcvNxt, rcvWnd, ttl)
 }
 
 // maybeSendOutOfWindowAck sends an ACK if we are not being rate limited

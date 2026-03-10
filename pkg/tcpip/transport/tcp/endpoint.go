@@ -847,6 +847,7 @@ type keepalive struct {
 	interval       time.Duration
 	count          int
 	unacked        int
+	ttl             uint8
 	// should never be a zero timer if the endpoint is not closed.
 	timer timer       `state:"nosave"`
 	waker sleep.Waker `state:"nosave"`
@@ -871,6 +872,7 @@ func newEndpoint(s *stack.Stack, protocol *protocol, netProto tcpip.NetworkProto
 			idle:     DefaultKeepaliveIdle,
 			interval: DefaultKeepaliveInterval,
 			count:    DefaultKeepaliveCount,
+			ttl:      0,
 		},
 		ipv4TTL:      tcpip.UseDefaultIPv4TTL,
 		ipv6HopLimit: tcpip.UseDefaultIPv6HopLimit,
@@ -1765,7 +1767,7 @@ func (e *Endpoint) OnReusePortSet(v bool) {
 // OnKeepAliveSet implements tcpip.SocketOptionsHandler.OnKeepAliveSet.
 func (e *Endpoint) OnKeepAliveSet(bool) {
 	e.LockUser()
-	e.resetKeepaliveTimer(true /* receivedData */)
+	e.resetKeepaliveTimer(true /* receivedData */, false /* isKeepaliveResponse */)
 	e.UnlockUser()
 }
 
@@ -1874,7 +1876,7 @@ func (e *Endpoint) SetSockOptInt(opt tcpip.SockOptInt, v int) tcpip.Error {
 		e.keepalive.Lock()
 		e.keepalive.count = v
 		e.keepalive.Unlock()
-		e.resetKeepaliveTimer(true /* receivedData */)
+		e.resetKeepaliveTimer(true /* receivedData */, false /* isKeepaliveResponse */)
 		e.UnlockUser()
 
 	case tcpip.IPv4TOSOption:
@@ -1971,7 +1973,7 @@ func (e *Endpoint) SetSockOpt(opt tcpip.SettableSocketOption) tcpip.Error {
 		e.keepalive.Lock()
 		e.keepalive.idle = time.Duration(*v)
 		e.keepalive.Unlock()
-		e.resetKeepaliveTimer(true /* receivedData */)
+		e.resetKeepaliveTimer(true /* receivedData */, false /* isKeepaliveResponse */)
 		e.UnlockUser()
 
 	case *tcpip.KeepaliveIntervalOption:
@@ -1979,7 +1981,14 @@ func (e *Endpoint) SetSockOpt(opt tcpip.SettableSocketOption) tcpip.Error {
 		e.keepalive.Lock()
 		e.keepalive.interval = time.Duration(*v)
 		e.keepalive.Unlock()
-		e.resetKeepaliveTimer(true /* receivedData */)
+		e.resetKeepaliveTimer(true /* receivedData */, false /* isKeepaliveResponse */)
+		e.UnlockUser()
+
+	case *tcpip.KeepaliveTTLOption:
+		e.LockUser()
+		e.keepalive.Lock()
+		e.keepalive.ttl = uint8(*v)
+		e.keepalive.Unlock()
 		e.UnlockUser()
 
 	case *tcpip.TCPUserTimeoutOption:
@@ -2189,6 +2198,11 @@ func (e *Endpoint) GetSockOpt(opt tcpip.GettableSocketOption) tcpip.Error {
 	case *tcpip.KeepaliveIntervalOption:
 		e.keepalive.Lock()
 		*o = tcpip.KeepaliveIntervalOption(e.keepalive.interval)
+		e.keepalive.Unlock()
+
+	case *tcpip.KeepaliveTTLOption:
+		e.keepalive.Lock()
+		*o = tcpip.KeepaliveTTLOption(e.keepalive.ttl)
 		e.keepalive.Unlock()
 
 	case *tcpip.TCPUserTimeoutOption:
@@ -2907,6 +2921,16 @@ func (e *Endpoint) onICMPError(err tcpip.Error, transErr stack.TransportError, p
 	}
 
 	if recvErr {
+		var controlSrc tcpip.Address
+		if pkt.NetworkHeader().View().Size() > 0 {
+			switch pkt.NetworkProtocolNumber {
+			case header.IPv4ProtocolNumber:
+				controlSrc = header.IPv4(pkt.NetworkHeader().Slice()).SourceAddress()
+			case header.IPv6ProtocolNumber:
+				controlSrc = header.IPv6(pkt.NetworkHeader().Slice()).SourceAddress()
+			}
+		}
+
 		e.SocketOptions().QueueErr(&tcpip.SockError{
 			Err:   err,
 			Cause: transErr,
@@ -2923,8 +2947,13 @@ func (e *Endpoint) onICMPError(err tcpip.Error, transErr stack.TransportError, p
 				Addr: e.TransportEndpointInfo.ID.LocalAddress,
 				Port: e.TransportEndpointInfo.ID.LocalPort,
 			},
+			ControlSrc: tcpip.FullAddress{
+				NIC:  pkt.NICID,
+				Addr: controlSrc,
+			},
 			NetProto: pkt.NetworkProtocolNumber,
 		})
+		e.waiterQueue.Notify(waiter.EventErr)
 	}
 
 	if e.EndpointState().connecting() {
@@ -2985,6 +3014,8 @@ func (e *Endpoint) HandleError(transErr stack.TransportError, pkt *stack.PacketB
 		e.onICMPError(&tcpip.ErrNoNet{}, transErr, pkt)
 	case stack.DestinationHostDownTransportError:
 		e.onICMPError(&tcpip.ErrHostDown{}, transErr, pkt)
+	case stack.TimeExceededTransportError:
+		e.onICMPError(&tcpip.ErrHostUnreachable{}, transErr, pkt)
 	}
 }
 

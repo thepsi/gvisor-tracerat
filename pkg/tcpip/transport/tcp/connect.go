@@ -303,7 +303,7 @@ func (h *handshake) synSentState(s *segment) tcpip.Error {
 		//   If the segment acknowledgment is not acceptable, form a reset segment,
 		//        <SEQ=SEG.ACK><CTL=RST>
 		//   and send it.
-		h.ep.sendEmptyRaw(header.TCPFlagRst, s.ackNumber, 0, 0)
+		h.ep.sendEmptyRaw(header.TCPFlagRst, s.ackNumber, 0, 0, 0)
 		// Since this was a challenge ACK reschedule the retransmit timer to fire
 		// soon so that the SYN is retransmitted quickly.
 		h.retransmitTimer.reinit(tcpMinTimeout)
@@ -337,7 +337,7 @@ func (h *handshake) synSentState(s *segment) tcpip.Error {
 		h.state = handshakeCompleted
 		h.transitionToStateEstablishedLocked(s)
 
-		h.ep.sendEmptyRaw(header.TCPFlagAck, h.iss+1, h.ackNum, h.rcvWnd>>h.effectiveRcvWndScale())
+		h.ep.sendEmptyRaw(header.TCPFlagAck, h.iss+1, h.ackNum, h.rcvWnd>>h.effectiveRcvWndScale(), 0)
 		return nil
 	}
 
@@ -407,7 +407,7 @@ func (h *handshake) synRcvdState(s *segment) tcpip.Error {
 			//   If the segment acknowledgment is not acceptable, form a reset segment,
 			//        <SEQ=SEG.ACK><CTL=RST>
 			//   and send it.
-			h.ep.sendEmptyRaw(header.TCPFlagRst, s.ackNumber, 0, 0)
+			h.ep.sendEmptyRaw(header.TCPFlagRst, s.ackNumber, 0, 0, 0)
 			return nil
 		}
 		// This is a cookie that snuck its way in after we stopped using them.
@@ -421,7 +421,7 @@ func (h *handshake) synRcvdState(s *segment) tcpip.Error {
 	// segment and return."
 	if !s.sequenceNumber.InWindow(h.ackNum, h.rcvWnd) {
 		if h.ep.allowOutOfWindowAck() {
-			h.ep.sendEmptyRaw(header.TCPFlagAck, h.iss+1, h.ackNum, h.rcvWnd)
+			h.ep.sendEmptyRaw(header.TCPFlagAck, h.iss+1, h.ackNum, h.rcvWnd, 0)
 		}
 		return nil
 	}
@@ -435,7 +435,7 @@ func (h *handshake) synRcvdState(s *segment) tcpip.Error {
 		if s.flags.Contains(header.TCPFlagAck) {
 			seq = s.ackNumber
 		}
-		h.ep.sendEmptyRaw(header.TCPFlagRst|header.TCPFlagAck, seq, ack, 0)
+		h.ep.sendEmptyRaw(header.TCPFlagRst|header.TCPFlagAck, seq, ack, 0, 0)
 
 		if !h.active {
 			return &tcpip.ErrInvalidEndpointState{}
@@ -1007,17 +1007,17 @@ func (e *Endpoint) makeOptions(sackBlocks []header.SACKBlock) []byte {
 // sendEmptyRaw sends a TCP segment with no payload to the endpoint's peer.
 //
 // +checklocks:e.mu
-func (e *Endpoint) sendEmptyRaw(flags header.TCPFlags, seq, ack seqnum.Value, rcvWnd seqnum.Size) tcpip.Error {
+func (e *Endpoint) sendEmptyRaw(flags header.TCPFlags, seq, ack seqnum.Value, rcvWnd seqnum.Size, ttl uint8) tcpip.Error {
 	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{})
 	defer pkt.DecRef()
-	return e.sendRaw(pkt, flags, seq, ack, rcvWnd)
+	return e.sendRaw(pkt, flags, seq, ack, rcvWnd, ttl)
 }
 
 // sendRaw sends a TCP segment to the endpoint's peer. This method takes
 // ownership of pkt. pkt must not have any headers set.
 //
 // +checklocks:e.mu
-func (e *Endpoint) sendRaw(pkt *stack.PacketBuffer, flags header.TCPFlags, seq, ack seqnum.Value, rcvWnd seqnum.Size) tcpip.Error {
+func (e *Endpoint) sendRaw(pkt *stack.PacketBuffer, flags header.TCPFlags, seq, ack seqnum.Value, rcvWnd seqnum.Size, ttl uint8) tcpip.Error {
 	var sackBlocks []header.SACKBlock
 	if e.EndpointState() == StateEstablished && e.rcv.pendingRcvdSegments.Len() > 0 && (flags&header.TCPFlagAck != 0) {
 		sackBlocks = e.sack.Blocks[:e.sack.NumBlocks]
@@ -1030,9 +1030,12 @@ func (e *Endpoint) sendRaw(pkt *stack.PacketBuffer, flags header.TCPFlags, seq, 
 		hdrSize += header.IPv6ExperimentHdrLength
 	}
 	pkt.ReserveHeaderBytes(hdrSize)
+	if ttl == 0 {
+		ttl = calculateTTL(e.route, e.ipv4TTL, e.ipv6HopLimit)
+	}
 	return e.sendTCP(e.route, tcpFields{
 		id:        e.TransportEndpointInfo.ID,
-		ttl:       calculateTTL(e.route, e.ipv4TTL, e.ipv6HopLimit),
+		ttl:       ttl,
 		tos:       e.sendTOS,
 		flags:     flags,
 		seq:       seq,
@@ -1095,7 +1098,7 @@ func (e *Endpoint) resetConnectionLocked(err tcpip.Error) {
 		if e.rcv != nil {
 			ackNum = e.rcv.RcvNxt
 		}
-		e.sendEmptyRaw(header.TCPFlagAck|header.TCPFlagRst, resetSeqNum, ackNum, 0)
+		e.sendEmptyRaw(header.TCPFlagAck|header.TCPFlagRst, resetSeqNum, ackNum, 0, 0)
 	}
 	// Don't purge read queues here. If there's buffered data, it's still allowed
 	// to be read.
@@ -1227,6 +1230,21 @@ func (e *Endpoint) handleSegmentsLocked() tcpip.Error {
 		if s == nil {
 			break
 		}
+
+		// Check if this is a keepalive response.
+		// A keepalive response is a segment that arrives when unacked > 0,
+		// has no data, and doesn't acknowledge new data.
+		isKeepaliveResponse := false
+		e.keepalive.Lock()
+		if e.keepalive.unacked > 0 && s.payloadSize() == 0 && e.snd != nil && !e.snd.SndUna.LessThan(s.ackNumber) {
+			isKeepaliveResponse = true
+		}
+		e.keepalive.Unlock()
+
+		if isKeepaliveResponse {
+			e.resetKeepaliveTimer(true /* receivedData */, true /* isKeepaliveResponse */)
+		}
+
 		cont, err := e.handleSegmentLocked(s)
 		s.DecRef()
 		if err != nil {
@@ -1253,7 +1271,7 @@ func (e *Endpoint) handleSegmentsLocked() tcpip.Error {
 		e.snd.sendAck()
 	}
 
-	e.resetKeepaliveTimer(true /* receivedData */)
+	e.resetKeepaliveTimer(true /* receivedData */, false /* isKeepaliveResponse */)
 
 	return nil
 }
@@ -1375,9 +1393,11 @@ func (e *Endpoint) keepaliveTimerExpired() tcpip.Error {
 	// RFC1122 4.2.3.6: TCP keepalive is a dataless ACK with
 	// seg.seq = snd.nxt-1.
 	e.keepalive.unacked++
+	ttl := e.keepalive.ttl
 	e.keepalive.Unlock()
-	e.snd.sendEmptySegment(header.TCPFlagAck, e.snd.SndNxt-1)
-	e.resetKeepaliveTimer(false)
+	e.snd.sendEmptySegment(header.TCPFlagAck, e.snd.SndNxt-1, ttl)
+	e.waiterQueue.Notify(waiter.EventKeepAliveSent)
+	e.resetKeepaliveTimer(false, false)
 	return nil
 }
 
@@ -1385,7 +1405,7 @@ func (e *Endpoint) keepaliveTimerExpired() tcpip.Error {
 // whether it is enabled for this endpoint.
 //
 // +checklocks:e.mu
-func (e *Endpoint) resetKeepaliveTimer(receivedData bool) {
+func (e *Endpoint) resetKeepaliveTimer(receivedData bool, isKeepaliveResponse bool) {
 	e.keepalive.Lock()
 	defer e.keepalive.Unlock()
 	if e.keepalive.timer.isUninitialized() {
@@ -1395,6 +1415,9 @@ func (e *Endpoint) resetKeepaliveTimer(receivedData bool) {
 		return
 	}
 	if receivedData {
+		if isKeepaliveResponse && e.keepalive.unacked > 0 {
+			e.waiterQueue.Notify(waiter.EventKeepAliveResponse)
+		}
 		e.keepalive.unacked = 0
 	}
 	// Start the keepalive timer IFF it's enabled and there is no pending

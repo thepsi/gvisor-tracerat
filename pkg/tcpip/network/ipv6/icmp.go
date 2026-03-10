@@ -148,6 +148,61 @@ func (*icmpv6PacketTooBigSockError) Kind() stack.TransportErrorKind {
 	return stack.PacketTooBigTransportError
 }
 
+// icmpv6TimeExceededSockError is a general ICMPv6 Time Exceeded error.
+//
+// +stateify savable
+type icmpv6TimeExceededSockError struct{}
+
+// Origin implements tcpip.SockErrorCause.
+func (*icmpv6TimeExceededSockError) Origin() tcpip.SockErrOrigin {
+	return tcpip.SockExtErrorOriginICMP6
+}
+
+// Type implements tcpip.SockErrorCause.
+func (*icmpv6TimeExceededSockError) Type() uint8 {
+	return uint8(header.ICMPv6TimeExceeded)
+}
+
+// Info implements tcpip.SockErrorCause.
+func (*icmpv6TimeExceededSockError) Info() uint32 {
+	return 0
+}
+
+// Kind implements stack.TransportError.
+func (*icmpv6TimeExceededSockError) Kind() stack.TransportErrorKind {
+	return stack.TimeExceededTransportError
+}
+
+var _ stack.TransportError = (*icmpv6HopLimitExceededSockError)(nil)
+
+// icmpv6HopLimitExceededSockError is an ICMPv6 Time Exceeded error due to hop
+// limit exceeded.
+//
+// +stateify savable
+type icmpv6HopLimitExceededSockError struct {
+	icmpv6TimeExceededSockError
+}
+
+// Code implements tcpip.SockErrorCause.
+func (*icmpv6HopLimitExceededSockError) Code() uint8 {
+	return uint8(header.ICMPv6HopLimitExceeded)
+}
+
+var _ stack.TransportError = (*icmpv6ReassemblyTimeoutSockError)(nil)
+
+// icmpv6ReassemblyTimeoutSockError is an ICMPv6 Time Exceeded error due to
+// reassembly timeout.
+//
+// +stateify savable
+type icmpv6ReassemblyTimeoutSockError struct {
+	icmpv6TimeExceededSockError
+}
+
+// Code implements tcpip.SockErrorCause.
+func (*icmpv6ReassemblyTimeoutSockError) Code() uint8 {
+	return uint8(header.ICMPv6ReassemblyTimeout)
+}
+
 func (e *endpoint) checkLocalAddress(addr tcpip.Address) bool {
 	if e.nic.Spoofing() {
 		return true
@@ -714,6 +769,12 @@ func (e *endpoint) handleICMP(pkt *stack.PacketBuffer, hasFragmentHeader bool, r
 
 	case header.ICMPv6TimeExceeded:
 		received.timeExceeded.Increment()
+		switch h.Code() {
+		case header.ICMPv6HopLimitExceeded:
+			e.handleControl(&icmpv6HopLimitExceededSockError{}, pkt)
+		case header.ICMPv6ReassemblyTimeout:
+			e.handleControl(&icmpv6ReassemblyTimeoutSockError{}, pkt)
+		}
 
 	case header.ICMPv6ParamProblem:
 		received.paramProblem.Increment()

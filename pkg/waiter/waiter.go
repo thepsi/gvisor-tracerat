@@ -76,8 +76,10 @@ const (
 	EventWrNorm   EventMask = 0x0100 // POLLWRNORM
 	EventInternal EventMask = 0x1000
 	EventRdHUp    EventMask = 0x2000 // POLLRDHUP
+	EventKeepAliveResponse EventMask = 0x4000
+	EventKeepAliveSent     EventMask = 0x8000
 
-	AllEvents      EventMask = 0x1f | EventRdNorm | EventWrNorm | EventRdHUp
+	AllEvents      EventMask = 0x1f | EventRdNorm | EventWrNorm | EventRdHUp | EventKeepAliveResponse | EventKeepAliveSent
 	ReadableEvents EventMask = EventIn | EventRdNorm
 	WritableEvents EventMask = EventOut | EventWrNorm
 )
