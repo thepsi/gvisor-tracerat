@@ -73,6 +73,7 @@ func (ch *connHelper) GetRemoteAddress() (tcpip.FullAddress, error) {
 }
 
 func (ch *connHelper) Write(p []byte) (int, error) {
+	// todo: handle ErrWouldBlock
 	var r bytes.Reader
 	r.Reset(p)
 	n, err := ch.ep.Write(&r, tcpip.WriteOptions{})
@@ -143,6 +144,8 @@ func (ch *connHelper) stopKeepalive() {
 }
 
 func (ch *connHelper) DoKeepalive(ttl int) (time.Duration, bool, *tcpip.Address, error) {
+	// todo: does this need to be bigger in case multiple events arrive in a
+	// short space of time?
 	notifyCh := make(chan waiter.EventMask, 1)
 	waitEntry := waiter.NewFunctionEntry(
 		waiter.ReadableEvents|waiter.EventKeepAliveResponse|waiter.EventKeepAliveSent|waiter.EventErr,
@@ -196,6 +199,21 @@ func (ch *connHelper) DoKeepalive(ttl int) (time.Duration, bool, *tcpip.Address,
 	}
 }
 
+func callAfter(f func(), d time.Duration) func() {
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-done:
+			return
+		case <-time.After(d):
+			f()
+		}
+	}()
+	return func() {
+		close(done)
+	}
+}
+
 func handleConnection(wq *waiter.Queue, ep tcpip.Endpoint) {
 	defer ep.Close()
 
@@ -211,15 +229,21 @@ func handleConnection(wq *waiter.Queue, ep tcpip.Endpoint) {
 	}
 	log.Printf("%p: connect from: %v", ep, remote)
 
+	// read request
+	cancel := callAfter(func() {
+		log.Printf("%p: timed out on initial read", ep)
+		ep.Close()
+	}, 10*time.Second)
 	br := bufio.NewReader(&ch)
 	req, err := http.ReadRequest(br)
+	cancel()
 	if err != nil {
 		log.Printf("%p: ReadRequest: %v", ep, err)
 		return
 	}
 	log.Printf("%p: got request: %s %s %s", ep, req.Method, req.URL, req.Proto)
 
-	ch.Write([]byte("HTTP/1.1 200 200 OK\r\n"))
+	ch.Write([]byte("HTTP/1.1 200 OK\r\n"))
 	ch.Write([]byte("content-type: text/plain; charset=utf-8\r\n"))
 	ch.Write([]byte("connection: close\r\n\r\n"))
 	ch.Write([]byte(fmt.Sprintf("%d sweeps, max %d hops:\n\n", sweeps, maxHops)))
