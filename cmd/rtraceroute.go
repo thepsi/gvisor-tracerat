@@ -243,6 +243,14 @@ func handleConnection(wq *waiter.Queue, ep tcpip.Endpoint) {
 	}
 	log.Printf("%p: got request: %s %s %s", ep, req.Method, req.URL, req.Proto)
 
+	if req.Method != "GET" || req.URL.EscapedPath() != "/" || req.Proto != "HTTP/1.1" {
+		log.Printf("%p: responding with error", ep)
+		ch.Write([]byte("HTTP/1.1 400 Bad Request\r\n"))
+		ch.Write([]byte("content-type: text/plain; charset=utf-8\r\n"))
+		ch.Write([]byte("connection: close\r\n\r\n"))
+		return
+	}
+
 	ch.Write([]byte("HTTP/1.1 200 OK\r\n"))
 	ch.Write([]byte("content-type: text/plain; charset=utf-8\r\n"))
 	ch.Write([]byte("connection: close\r\n\r\n"))
