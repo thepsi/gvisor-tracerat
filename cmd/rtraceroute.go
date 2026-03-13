@@ -46,9 +46,12 @@ import (
 	"gvisor.dev/gvisor/pkg/waiter"
 )
 
-const maxHops = 63
+const (
+	sweeps  = 3
+	maxHops = 63
+)
 
-type endpointReadWriter struct {
+type connHelper struct {
 	ep tcpip.Endpoint
 	wq *waiter.Queue
 }
@@ -61,18 +64,18 @@ func (e *tcpipError) Error() string {
 	return e.inner.String()
 }
 
-func (e *endpointReadWriter) GetRemoteAddress() (tcpip.FullAddress, error) {
-	addr, err := e.ep.GetRemoteAddress()
+func (ch *connHelper) GetRemoteAddress() (tcpip.FullAddress, error) {
+	addr, err := ch.ep.GetRemoteAddress()
 	if err != nil {
 		return addr, &tcpipError{inner: err}
 	}
 	return addr, nil
 }
 
-func (e *endpointReadWriter) Write(p []byte) (int, error) {
+func (ch *connHelper) Write(p []byte) (int, error) {
 	var r bytes.Reader
 	r.Reset(p)
-	n, err := e.ep.Write(&r, tcpip.WriteOptions{})
+	n, err := ch.ep.Write(&r, tcpip.WriteOptions{})
 	if err != nil {
 		return int(n), &tcpipError{
 			inner: err,
@@ -84,9 +87,9 @@ func (e *endpointReadWriter) Write(p []byte) (int, error) {
 	return int(n), nil
 }
 
-func (e *endpointReadWriter) Read(p []byte) (int, error) {
+func (ch *connHelper) Read(p []byte) (int, error) {
 	w := tcpip.SliceWriter(p)
-	res, err := e.ep.Read(&w, tcpip.ReadOptions{})
+	res, err := ch.ep.Read(&w, tcpip.ReadOptions{})
 	if err == nil {
 		return res.Count, nil
 	}
@@ -96,12 +99,12 @@ func (e *endpointReadWriter) Read(p []byte) (int, error) {
 
 	// Create a wait entry.
 	waitEntry, notifyCh := waiter.NewChannelEntry(waiter.ReadableEvents)
-	e.wq.EventRegister(&waitEntry)
-	defer e.wq.EventUnregister(&waitEntry)
+	ch.wq.EventRegister(&waitEntry)
+	defer ch.wq.EventUnregister(&waitEntry)
 
 	for {
 		w := tcpip.SliceWriter(p)
-		res, err := e.ep.Read(&w, tcpip.ReadOptions{})
+		res, err := ch.ep.Read(&w, tcpip.ReadOptions{})
 		if err == nil {
 			return res.Count, nil
 		}
@@ -113,22 +116,102 @@ func (e *endpointReadWriter) Read(p []byte) (int, error) {
 	}
 }
 
+func (ch *connHelper) startKeepalive(ttl int) error {
+	ch.ep.SocketOptions().SetIPv4RecvError(true)
+	ch.ep.SocketOptions().SetIPv6RecvError(true)
+	ttlOpt := tcpip.KeepaliveTTLOption(ttl)
+	if err := ch.ep.SetSockOpt(&ttlOpt); err != nil {
+		return fmt.Errorf("failed to set KeepaliveTTLOption: %v", err)
+	}
+	// initial delay
+	idle := tcpip.KeepaliveIdleOption(500 * time.Millisecond)
+	if err := ch.ep.SetSockOpt(&idle); err != nil {
+		return fmt.Errorf("failed to set KeepaliveIdleOption: %v", err)
+	}
+	// time between keepalives; this needs to be longer than our timeout below
+	interval := tcpip.KeepaliveIntervalOption(5 * time.Second)
+	if err := ch.ep.SetSockOpt(&interval); err != nil {
+		return fmt.Errorf("failed to set KeepaliveIntervalOption: %v", err)
+	}
+	// Start the keepalive
+	ch.ep.SocketOptions().SetKeepAlive(true)
+	return nil
+}
+
+func (ch *connHelper) stopKeepalive() {
+	ch.ep.SocketOptions().SetKeepAlive(false)
+}
+
+func (ch *connHelper) DoKeepalive(ttl int) (time.Duration, bool, *tcpip.Address, error) {
+	notifyCh := make(chan waiter.EventMask, 1)
+	waitEntry := waiter.NewFunctionEntry(
+		waiter.ReadableEvents|waiter.EventKeepAliveResponse|waiter.EventKeepAliveSent|waiter.EventErr,
+		func(mask waiter.EventMask) {
+			select {
+			case notifyCh <- mask:
+			default:
+			}
+		})
+	ch.wq.EventRegister(&waitEntry)
+	defer ch.wq.EventUnregister(&waitEntry)
+
+	if err := ch.startKeepalive(ttl); err != nil {
+		return 0, false, nil, fmt.Errorf("startKeepalive: %v", err)
+	}
+	defer ch.stopKeepalive()
+
+	var lastSent time.Time
+	for {
+		var buf bytes.Buffer
+		select {
+		case <-time.After(3 * time.Second):
+			// timeout
+			return 0, false, nil, nil
+		case ev := <-notifyCh:
+			switch {
+			case ev&waiter.ReadableEvents != 0:
+				// client sent us something or disconnected
+				if _, err := ch.ep.Read(&buf, tcpip.ReadOptions{}); err != nil {
+					return 0, false, nil, fmt.Errorf("failed to read: %v", err)
+				}
+				log.Printf("%p: ignoring %d bytes", ch.ep, buf.Len())
+			case ev&waiter.EventKeepAliveSent != 0:
+				lastSent = time.Now()
+				log.Printf("%p: keepalive sent", ch.ep)
+			case ev&waiter.EventKeepAliveResponse != 0:
+				latency := time.Now().Sub(lastSent)
+				return latency, true, nil, nil
+			case ev&waiter.EventErr != 0:
+				// errors
+				for {
+					err := ch.ep.SocketOptions().DequeueErr()
+					if err == nil {
+						break
+					}
+					latency := time.Now().Sub(lastSent)
+					return latency, false, &err.ControlSrc.Addr, nil
+				}
+			}
+		}
+	}
+}
+
 func handleConnection(wq *waiter.Queue, ep tcpip.Endpoint) {
 	defer ep.Close()
 
-	rw := endpointReadWriter{
+	ch := connHelper{
 		ep: ep,
 		wq: wq,
 	}
 
-	remote, err := rw.GetRemoteAddress()
+	remote, err := ch.GetRemoteAddress()
 	if err != nil {
 		log.Printf("%p: failed to get remote address: %v", ep, err)
 		return
 	}
 	log.Printf("%p: connect from: %v", ep, remote)
 
-	br := bufio.NewReader(&rw)
+	br := bufio.NewReader(&ch)
 	req, err := http.ReadRequest(br)
 	if err != nil {
 		log.Printf("%p: ReadRequest: %v", ep, err)
@@ -136,118 +219,34 @@ func handleConnection(wq *waiter.Queue, ep tcpip.Endpoint) {
 	}
 	log.Printf("%p: got request: %s %s %s", ep, req.Method, req.URL, req.Proto)
 
-	rw.Write([]byte("HTTP/1.1 200 200 OK\r\n"))
-	rw.Write([]byte("content-type: text/plain; charset=utf-8\r\n"))
-	rw.Write([]byte("connection: close\r\n\r\n"))
+	ch.Write([]byte("HTTP/1.1 200 200 OK\r\n"))
+	ch.Write([]byte("content-type: text/plain; charset=utf-8\r\n"))
+	ch.Write([]byte("connection: close\r\n\r\n"))
+	ch.Write([]byte(fmt.Sprintf("%d sweeps, max %d hops:\n\n", sweeps, maxHops)))
 
-	// Enable keepalives.
-	ep.SocketOptions().SetKeepAlive(true)
-
-	// Enable error reporting.
-	ep.SocketOptions().SetIPv4RecvError(true)
-	ep.SocketOptions().SetIPv6RecvError(true)
-
-	// Set a custom TTL for keepalive packets.
-	var currentTTL int
-	updateTTL := func(newTTL int) {
-		currentTTL = newTTL
-		log.Printf("%p: updating TTL to: %d", ep, currentTTL)
-		ttl := tcpip.KeepaliveTTLOption(currentTTL)
-		if err := ep.SetSockOpt(&ttl); err != nil {
-			log.Printf("%p: failed to set KeepaliveTTLOption: %v", ep, err)
-		}
-	}
-	incrementTTL := func() {
-		updateTTL(currentTTL + 1)
-	}
-	resetKeepalive := func() {
-		ep.SocketOptions().SetKeepAlive(false)
-		ep.SocketOptions().SetKeepAlive(true)
-	}
-	updateTTL(1)
-
-	// idle time before first keepalive
-	idle := tcpip.KeepaliveIdleOption(time.Second)
-	if err := ep.SetSockOpt(&idle); err != nil {
-		log.Printf("%p: failed to set KeepaliveIdleOption: %v", ep, err)
-	}
-	// time between keepalives; this needs to be longer than our timeout below
-	interval := tcpip.KeepaliveIntervalOption(5 * time.Second)
-	if err := ep.SetSockOpt(&interval); err != nil {
-		log.Printf("%p: failed to set KeepaliveIntervalOption: %v", ep, err)
-	}
-
-	// Create wait queue entry that notifies a channel for readable, keepalive response, and error events.
-	notifyCh := make(chan waiter.EventMask, 1)
-	waitEntry := waiter.NewFunctionEntry(waiter.ReadableEvents|waiter.EventKeepAliveResponse|waiter.EventKeepAliveSent|waiter.EventErr, func(mask waiter.EventMask) {
-		select {
-		case notifyCh <- mask:
-		default:
-		}
-	})
-	wq.EventRegister(&waitEntry)
-	defer wq.EventUnregister(&waitEntry)
-
-	var lastSent time.Time
-	sweepsRemaining := 3
-	rw.Write([]byte(fmt.Sprintf("%d sweeps, max %d hops:\n\n", sweepsRemaining, maxHops)))
-
-outerLoop:
-	for {
-		var buf bytes.Buffer
-		select {
-		case <-time.After(3 * time.Second):
-			log.Printf("%p: timeout", ep)
-			rw.Write([]byte(fmt.Sprintf("%d: timeout\n", currentTTL)))
-			incrementTTL()
-			if currentTTL > maxHops {
-				log.Printf("%p: resetting TTL", ep)
-				updateTTL(1)
-				sweepsRemaining--
-				if sweepsRemaining == 0 {
-					break outerLoop
-				}
-			}
-			resetKeepalive()
-		case ev := <-notifyCh:
-			if ev&waiter.ReadableEvents != 0 {
-				if _, err := ep.Read(&buf, tcpip.ReadOptions{}); err != nil {
-					log.Printf("%p: failed to read, exiting: %v", ep, err)
-					return
-				}
-				log.Printf("%p: ignoring %d bytes", ep, buf.Len())
-			}
-			if ev&waiter.EventKeepAliveSent != 0 {
-				lastSent = time.Now()
-				log.Printf("%p: keepalive sent", ep)
-			}
-			if ev&waiter.EventKeepAliveResponse != 0 {
-				delta := time.Now().Sub(lastSent)
+sweeps:
+	for sweep := 1; sweep <= sweeps; sweep++ {
+		for ttl := 1; ttl <= maxHops; ttl++ {
+			latency, done, addr, err := ch.DoKeepalive(ttl)
+			switch {
+			case err != nil:
+				log.Printf("%p: error: %v", ep, err)
+				return
+			case latency == 0:
+				log.Printf("%p: timeout", ep)
+				ch.Write([]byte(fmt.Sprintf("%d: timeout\n", ttl)))
+			case !done:
+				log.Printf("%p: error from %v in %v", ep, addr, latency)
+				ch.Write([]byte(fmt.Sprintf("%d: got error from %v after %v\n", ttl, addr, latency)))
+			default:
 				log.Printf("%p: keepalive response received", ep)
-				rw.Write([]byte(fmt.Sprintf("%d: got response from %v after %v\n\n", currentTTL, remote.Addr, delta)))
-				updateTTL(1)
-				resetKeepalive()
-				sweepsRemaining--
-				if sweepsRemaining == 0 {
-					break outerLoop
-				}
-			}
-			if ev&waiter.EventErr != 0 {
-				for {
-					err := ep.SocketOptions().DequeueErr()
-					if err == nil {
-						break
-					}
-					delta := time.Now().Sub(lastSent)
-					log.Printf("%p: error received: %v (orig dst: %v, offender: %v, control source: %v)", ep, err.Err, err.Dst, err.Offender, err.ControlSrc)
-					rw.Write([]byte(fmt.Sprintf("%d: got error (%v) from %v after %v\n", currentTTL, err.Err, err.ControlSrc.Addr, delta)))
-					incrementTTL()
-					resetKeepalive()
-				}
+				ch.Write([]byte(fmt.Sprintf("%d: got response from %v after %v\n\n", ttl, remote.Addr, latency)))
+				continue sweeps
 			}
 		}
 	}
-	rw.Write([]byte("bye!\r\n"))
+
+	ch.Write([]byte("bye!\r\n"))
 }
 
 func main() {
