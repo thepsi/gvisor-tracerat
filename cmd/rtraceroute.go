@@ -21,12 +21,14 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"strconv"
 	"strings"
@@ -47,6 +49,8 @@ import (
 var tap = flag.Bool("tap", false, "use tap instead of tun")
 var mac = flag.String("mac", "aa:00:01:01:01:01", "mac address to use in tap device")
 
+const maxHops = 63
+
 type endpointReadWriter struct {
 	ep tcpip.Endpoint
 	wq *waiter.Queue
@@ -58,6 +62,14 @@ type tcpipError struct {
 
 func (e *tcpipError) Error() string {
 	return e.inner.String()
+}
+
+func (e *endpointReadWriter) GetRemoteAddress() (tcpip.FullAddress, error) {
+	addr, err := e.ep.GetRemoteAddress()
+	if err != nil {
+		return addr, &tcpipError{inner: err}
+	}
+	return addr, nil
 }
 
 func (e *endpointReadWriter) Write(p []byte) (int, error) {
@@ -107,6 +119,30 @@ func (e *endpointReadWriter) Read(p []byte) (int, error) {
 func handleConnection(wq *waiter.Queue, ep tcpip.Endpoint) {
 	defer ep.Close()
 
+	rw := endpointReadWriter{
+		ep: ep,
+		wq: wq,
+	}
+
+	remote, err := rw.GetRemoteAddress()
+	if err != nil {
+		log.Printf("%p: failed to get remote address: %v", ep, err)
+		return
+	}
+	log.Printf("%p: connect from: %v", ep, remote)
+
+	br := bufio.NewReader(&rw)
+	req, err := http.ReadRequest(br)
+	if err != nil {
+		log.Printf("%p: ReadRequest: %v", ep, err)
+		return
+	}
+	log.Printf("%p: got request: %s %s %s", ep, req.Method, req.URL, req.Proto)
+
+	rw.Write([]byte("HTTP/1.1 200 200 OK\r\n"))
+	rw.Write([]byte("content-type: text/plain; charset=utf-8\r\n"))
+	rw.Write([]byte("connection: close\r\n\r\n"))
+
 	// Enable keepalives.
 	ep.SocketOptions().SetKeepAlive(true)
 
@@ -118,7 +154,7 @@ func handleConnection(wq *waiter.Queue, ep tcpip.Endpoint) {
 	var currentTTL int
 	updateTTL := func(newTTL int) {
 		currentTTL = newTTL
-		log.Printf("Updating TTL to: %d", currentTTL)
+		log.Printf("%p: updating TTL to: %d", ep, currentTTL)
 		ttl := tcpip.KeepaliveTTLOption(currentTTL)
 		if err := ep.SetSockOpt(&ttl); err != nil {
 			log.Printf("%p: failed to set KeepaliveTTLOption: %v", ep, err)
@@ -155,18 +191,11 @@ func handleConnection(wq *waiter.Queue, ep tcpip.Endpoint) {
 	wq.EventRegister(&waitEntry)
 	defer wq.EventUnregister(&waitEntry)
 
-	rw := endpointReadWriter{
-		ep: ep,
-		wq: wq,
-	}
-
-	remote, err := ep.GetRemoteAddress()
-	if err != nil {
-		log.Printf("%p: failed to get remote address: %v", ep, err)
-		return
-	}
 	var lastSent time.Time
+	sweepsRemaining := 3
+	rw.Write([]byte(fmt.Sprintf("%d sweeps, max %d hops:\n\n", sweepsRemaining, maxHops)))
 
+outerLoop:
 	for {
 		var buf bytes.Buffer
 		select {
@@ -174,9 +203,13 @@ func handleConnection(wq *waiter.Queue, ep tcpip.Endpoint) {
 			log.Printf("%p: timeout", ep)
 			rw.Write([]byte(fmt.Sprintf("%d: timeout\n", currentTTL)))
 			incrementTTL()
-			if currentTTL > 63 {
+			if currentTTL > maxHops {
 				log.Printf("%p: resetting TTL", ep)
 				updateTTL(1)
+				sweepsRemaining--
+				if sweepsRemaining == 0 {
+					break outerLoop
+				}
 			}
 			resetKeepalive()
 		case ev := <-notifyCh:
@@ -197,6 +230,10 @@ func handleConnection(wq *waiter.Queue, ep tcpip.Endpoint) {
 				rw.Write([]byte(fmt.Sprintf("%d: got response from %v after %v\n\n", currentTTL, remote.Addr, delta)))
 				updateTTL(1)
 				resetKeepalive()
+				sweepsRemaining--
+				if sweepsRemaining == 0 {
+					break outerLoop
+				}
 			}
 			if ev&waiter.EventErr != 0 {
 				for {
@@ -213,6 +250,7 @@ func handleConnection(wq *waiter.Queue, ep tcpip.Endpoint) {
 			}
 		}
 	}
+	rw.Write([]byte("bye!\r\n"))
 }
 
 func main() {
@@ -322,6 +360,7 @@ func main() {
 	if err := ep.Bind(tcpip.FullAddress{Port: uint16(localPort)}); err != nil {
 		log.Fatal("Bind failed: ", err)
 	}
+	log.Printf("bound to %s:%d", addrWithPrefix, localPort)
 
 	if err := ep.Listen(10); err != nil {
 		log.Fatal("Listen failed: ", err)
