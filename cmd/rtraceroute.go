@@ -47,8 +47,9 @@ import (
 var tap = flag.Bool("tap", false, "use tap instead of tun")
 var mac = flag.String("mac", "aa:00:01:01:01:01", "mac address to use in tap device")
 
-type endpointWriter struct {
+type endpointReadWriter struct {
 	ep tcpip.Endpoint
+	wq *waiter.Queue
 }
 
 type tcpipError struct {
@@ -59,7 +60,7 @@ func (e *tcpipError) Error() string {
 	return e.inner.String()
 }
 
-func (e *endpointWriter) Write(p []byte) (int, error) {
+func (e *endpointReadWriter) Write(p []byte) (int, error) {
 	var r bytes.Reader
 	r.Reset(p)
 	n, err := e.ep.Write(&r, tcpip.WriteOptions{})
@@ -72,6 +73,35 @@ func (e *endpointWriter) Write(p []byte) (int, error) {
 		return int(n), io.ErrShortWrite
 	}
 	return int(n), nil
+}
+
+func (e *endpointReadWriter) Read(p []byte) (int, error) {
+	w := tcpip.SliceWriter(p)
+	res, err := e.ep.Read(&w, tcpip.ReadOptions{})
+	if err == nil {
+		return res.Count, nil
+	}
+	if _, ok := err.(*tcpip.ErrWouldBlock); !ok {
+		return res.Count, &tcpipError{inner: err}
+	}
+
+	// Create a wait entry.
+	waitEntry, notifyCh := waiter.NewChannelEntry(waiter.ReadableEvents)
+	e.wq.EventRegister(&waitEntry)
+	defer e.wq.EventUnregister(&waitEntry)
+
+	for {
+		w := tcpip.SliceWriter(p)
+		res, err := e.ep.Read(&w, tcpip.ReadOptions{})
+		if err == nil {
+			return res.Count, nil
+		}
+		if _, ok := err.(*tcpip.ErrWouldBlock); !ok {
+			return res.Count, &tcpipError{inner: err}
+		}
+
+		<-notifyCh
+	}
 }
 
 func handleConnection(wq *waiter.Queue, ep tcpip.Endpoint) {
@@ -125,8 +155,9 @@ func handleConnection(wq *waiter.Queue, ep tcpip.Endpoint) {
 	wq.EventRegister(&waitEntry)
 	defer wq.EventUnregister(&waitEntry)
 
-	w := endpointWriter{
+	rw := endpointReadWriter{
 		ep: ep,
+		wq: wq,
 	}
 
 	remote, err := ep.GetRemoteAddress()
@@ -141,7 +172,7 @@ func handleConnection(wq *waiter.Queue, ep tcpip.Endpoint) {
 		select {
 		case <-time.After(3 * time.Second):
 			log.Printf("%p: timeout", ep)
-			w.Write([]byte(fmt.Sprintf("%d: timeout\n", currentTTL)))
+			rw.Write([]byte(fmt.Sprintf("%d: timeout\n", currentTTL)))
 			incrementTTL()
 			if currentTTL > 63 {
 				log.Printf("%p: resetting TTL", ep)
@@ -163,7 +194,7 @@ func handleConnection(wq *waiter.Queue, ep tcpip.Endpoint) {
 			if ev&waiter.EventKeepAliveResponse != 0 {
 				delta := time.Now().Sub(lastSent)
 				log.Printf("%p: keepalive response received", ep)
-				w.Write([]byte(fmt.Sprintf("%d: got response from %v after %v\n\n", currentTTL, remote.Addr, delta)))
+				rw.Write([]byte(fmt.Sprintf("%d: got response from %v after %v\n\n", currentTTL, remote.Addr, delta)))
 				updateTTL(1)
 				resetKeepalive()
 			}
@@ -175,7 +206,7 @@ func handleConnection(wq *waiter.Queue, ep tcpip.Endpoint) {
 					}
 					delta := time.Now().Sub(lastSent)
 					log.Printf("%p: error received: %v (orig dst: %v, offender: %v, control source: %v)", ep, err.Err, err.Dst, err.Offender, err.ControlSrc)
-					w.Write([]byte(fmt.Sprintf("%d: got error (%v) from %v after %v\n", currentTTL, err.Err, err.ControlSrc.Addr, delta)))
+					rw.Write([]byte(fmt.Sprintf("%d: got error (%v) from %v after %v\n", currentTTL, err.Err, err.ControlSrc.Addr, delta)))
 					incrementTTL()
 					resetKeepalive()
 				}
