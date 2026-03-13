@@ -46,9 +46,6 @@ import (
 	"gvisor.dev/gvisor/pkg/waiter"
 )
 
-var tap = flag.Bool("tap", false, "use tap instead of tun")
-var mac = flag.String("mac", "aa:00:01:01:01:01", "mac address to use in tap device")
-
 const maxHops = 63
 
 type endpointReadWriter struct {
@@ -263,12 +260,6 @@ func main() {
 	addrName := flag.Arg(1)
 	portName := flag.Arg(2)
 
-	// Parse the mac address.
-	maddr, err := net.ParseMAC(*mac)
-	if err != nil {
-		log.Fatalf("Bad MAC address: %v", *mac)
-	}
-
 	// Parse the IP address. Support both ipv4 and ipv6.
 	parsedAddr := net.ParseIP(addrName)
 	if parsedAddr == nil {
@@ -305,20 +296,14 @@ func main() {
 	}
 
 	var fd int
-	if *tap {
-		fd, err = tun.OpenTAP(tunName)
-	} else {
-		fd, err = tun.Open(tunName)
-	}
+	fd, err = tun.Open(tunName)
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	linkEP, err := fdbased.New(&fdbased.Options{
-		FDs:            []int{fd},
-		MTU:            mtu,
-		EthernetHeader: *tap,
-		Address:        tcpip.LinkAddress(maddr),
+		FDs: []int{fd},
+		MTU: mtu,
 	})
 	if err != nil {
 		log.Fatal(err)
