@@ -177,10 +177,10 @@ func (ch *connHelper) DoKeepalive(ttl int) (time.Duration, bool, *tcpip.Address,
 				if _, err := ch.ep.Read(&buf, tcpip.ReadOptions{}); err != nil {
 					return 0, false, nil, fmt.Errorf("failed to read: %v", err)
 				}
-				log.Printf("%p: ignoring %d bytes", ch.ep, buf.Len())
+				log.Printf("%p: received %d bytes, ignoring", ch.ep, buf.Len())
 			case ev&waiter.EventKeepAliveSent != 0:
 				lastSent = time.Now()
-				log.Printf("%p: keepalive sent", ch.ep)
+				log.Printf("%p: keepalive sent, ttl=%d", ch.ep, ttl)
 			case ev&waiter.EventKeepAliveResponse != 0:
 				latency := time.Now().Sub(lastSent)
 				return latency, true, nil, nil
@@ -227,7 +227,7 @@ func handleConnection(wq *waiter.Queue, ep tcpip.Endpoint) {
 		log.Printf("%p: failed to get remote address: %v", ep, err)
 		return
 	}
-	log.Printf("%p: connect from: %v", ep, remote)
+	log.Printf("%p: connect from: %s:%d", ep, remote.Addr, remote.Port)
 
 	// read request
 	cancel := callAfter(func() {
@@ -241,10 +241,10 @@ func handleConnection(wq *waiter.Queue, ep tcpip.Endpoint) {
 		log.Printf("%p: ReadRequest: %v", ep, err)
 		return
 	}
-	log.Printf("%p: got request: %s %s %s", ep, req.Method, req.URL, req.Proto)
+	log.Printf("%p: request: %s %s %s", ep, req.Method, req.URL, req.Proto)
 
 	if req.Method != "GET" || req.URL.EscapedPath() != "/" || req.Proto != "HTTP/1.1" {
-		log.Printf("%p: responding with error", ep)
+		log.Printf("%p: responding with HTTP 400", ep)
 		ch.Write([]byte("HTTP/1.1 400 Bad Request\r\n"))
 		ch.Write([]byte("content-type: text/plain; charset=utf-8\r\n"))
 		ch.Write([]byte("connection: close\r\n\r\n"))
@@ -271,11 +271,12 @@ sweeps:
 				log.Printf("%p: error from %v in %v", ep, addr, latency)
 				ch.Write([]byte(fmt.Sprintf("%d: got error from %v after %v\n", ttl, addr, latency)))
 			default:
-				log.Printf("%p: keepalive response received", ep)
+				log.Printf("%p: response from %s in %v", ep, remote.Addr, latency)
 				ch.Write([]byte(fmt.Sprintf("%d: got response from %v after %v\n\n", ttl, remote.Addr, latency)))
 				continue sweeps
 			}
 		}
+		log.Printf("%p: hit max TTL", ep)
 	}
 
 	ch.Write([]byte("bye!\r\n"))
