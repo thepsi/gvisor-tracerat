@@ -12,12 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build linux
-// +build linux
-
-// This sample creates a stack with TCP and IPv4 protocols on top of a TUN
-// device, and listens on a port. Data received by the server in the accepted
-// connections is echoed back to the clients.
 package main
 
 import (
@@ -43,12 +37,17 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
 	"gvisor.dev/gvisor/pkg/waiter"
+
+	_ "embed"
 )
 
 const (
 	sweeps  = 3
 	maxHops = 63
 )
+
+//go:embed rat.txt
+var rat []byte
 
 type connHelper struct {
 	ep tcpip.Endpoint
@@ -253,6 +252,7 @@ func handleConnection(wq *waiter.Queue, ep tcpip.Endpoint) {
 	ch.Write([]byte("HTTP/1.1 200 OK\r\n"))
 	ch.Write([]byte("content-type: text/plain; charset=utf-8\r\n"))
 	ch.Write([]byte("connection: close\r\n\r\n"))
+	ch.Write(rat)
 	ch.Write([]byte(fmt.Sprintf("%d sweeps, max %d hops:\n\n", sweeps, maxHops)))
 
 sweeps:
