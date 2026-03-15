@@ -25,7 +25,6 @@ import (
 	"bytes"
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"net/http"
@@ -73,31 +72,31 @@ func (ch *connHelper) GetRemoteAddress() (tcpip.FullAddress, error) {
 }
 
 func (ch *connHelper) Write(p []byte) (int, error) {
-	// todo: handle ErrWouldBlock
-	var r bytes.Reader
-	r.Reset(p)
-	n, err := ch.ep.Write(&r, tcpip.WriteOptions{})
-	if err != nil {
-		return int(n), &tcpipError{
-			inner: err,
+	// Create a wait entry.
+	waitEntry, notifyCh := waiter.NewChannelEntry(waiter.WritableEvents)
+	ch.wq.EventRegister(&waitEntry)
+	defer ch.wq.EventUnregister(&waitEntry)
+
+	var total int
+	for total < len(p) {
+		var r bytes.Reader
+		r.Reset(p[total:])
+		n, err := ch.ep.Write(&r, tcpip.WriteOptions{})
+		total += int(n)
+		if err == nil {
+			continue
 		}
+
+		if _, ok := err.(*tcpip.ErrWouldBlock); !ok {
+			return total, &tcpipError{inner: err}
+		}
+
+		<-notifyCh
 	}
-	if n != int64(len(p)) {
-		return int(n), io.ErrShortWrite
-	}
-	return int(n), nil
+	return total, nil
 }
 
 func (ch *connHelper) Read(p []byte) (int, error) {
-	w := tcpip.SliceWriter(p)
-	res, err := ch.ep.Read(&w, tcpip.ReadOptions{})
-	if err == nil {
-		return res.Count, nil
-	}
-	if _, ok := err.(*tcpip.ErrWouldBlock); !ok {
-		return res.Count, &tcpipError{inner: err}
-	}
-
 	// Create a wait entry.
 	waitEntry, notifyCh := waiter.NewChannelEntry(waiter.ReadableEvents)
 	ch.wq.EventRegister(&waitEntry)
@@ -227,7 +226,7 @@ func handleConnection(wq *waiter.Queue, ep tcpip.Endpoint) {
 		log.Printf("%p: failed to get remote address: %v", ep, err)
 		return
 	}
-	log.Printf("%p: connect from: %s:%d", ep, remote.Addr, remote.Port)
+	log.Printf("%p: connect from %s:%d", ep, remote.Addr, remote.Port)
 
 	// read request
 	cancel := callAfter(func() {
@@ -280,6 +279,7 @@ sweeps:
 	}
 
 	ch.Write([]byte("bye!\r\n"))
+	log.Printf("%p: done", ep)
 }
 
 func main() {
