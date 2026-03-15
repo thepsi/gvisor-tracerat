@@ -265,7 +265,7 @@ sweeps:
 	for sweep := 1; sweep <= sweeps; sweep++ {
 		for ttl := 1; ttl <= maxHops; ttl++ {
 			if ttl <= *skipFirstHops {
-				ch.Write([]byte(fmt.Sprintf("%d: skipped\n", ttl)))
+				ch.Write([]byte(fmt.Sprintf("%d: (skipped)\n", ttl)))
 				continue
 			}
 			latency, done, addr, err := ch.DoKeepalive(ttl)
