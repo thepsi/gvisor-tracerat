@@ -20,5 +20,5 @@ function on_exit {
 }
 trap on_exit EXIT
 
-sudo -u $RUNAS ./rtraceroute $DEVICE $PREFIX.2 3001
-#sudo -u $RUNAS ./rtraceroute $DEVICE $V6PREFIX::2 3001
+sudo -u $RUNAS ./rtraceroute --device=$DEVICE --address=$PREFIX.2 --port=3001 "$@"
+#sudo -u $RUNAS ./rtraceroute "$@" $DEVICE $V6PREFIX::2 3001

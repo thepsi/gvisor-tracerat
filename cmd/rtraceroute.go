@@ -23,7 +23,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 
@@ -44,6 +43,13 @@ import (
 const (
 	sweeps  = 3
 	maxHops = 63
+)
+
+var (
+	skipFirstHops = flag.Int("skip_first_hops", 0, "Skip this number of hops at the beginning.")
+	device        = flag.String("device", "", "TUN device.")
+	address       = flag.String("address", "", "Address to bind to.")
+	localPort     = flag.Int("port", 3001, "Port number to bind to.")
 )
 
 //go:embed rat.txt
@@ -258,6 +264,10 @@ func handleConnection(wq *waiter.Queue, ep tcpip.Endpoint) {
 sweeps:
 	for sweep := 1; sweep <= sweeps; sweep++ {
 		for ttl := 1; ttl <= maxHops; ttl++ {
+			if ttl <= *skipFirstHops {
+				ch.Write([]byte(fmt.Sprintf("%d: skipped\n", ttl)))
+				continue
+			}
 			latency, done, addr, err := ch.DoKeepalive(ttl)
 			switch {
 			case err != nil:
@@ -284,18 +294,14 @@ sweeps:
 
 func main() {
 	flag.Parse()
-	if len(flag.Args()) != 3 {
-		log.Fatal("Usage: ", os.Args[0], " <tun-device> <local-address> <local-port>")
+	if len(flag.Args()) > 0 {
+		log.Fatal("Usage: ", os.Args[0], " --device=<tun-device> --address=<local-address> --port=<local-port>")
 	}
 
-	tunName := flag.Arg(0)
-	addrName := flag.Arg(1)
-	portName := flag.Arg(2)
-
 	// Parse the IP address. Support both ipv4 and ipv6.
-	parsedAddr := net.ParseIP(addrName)
+	parsedAddr := net.ParseIP(*address)
 	if parsedAddr == nil {
-		log.Fatalf("Bad IP address: %v", addrName)
+		log.Fatalf("Bad IP address: %v", *address)
 	}
 
 	var addrWithPrefix tcpip.AddressWithPrefix
@@ -307,12 +313,7 @@ func main() {
 		addrWithPrefix = tcpip.AddrFromSlice(parsedAddr.To16()).WithPrefix()
 		proto = ipv6.ProtocolNumber
 	} else {
-		log.Fatalf("Unknown IP type: %v", addrName)
-	}
-
-	localPort, err := strconv.Atoi(portName)
-	if err != nil {
-		log.Fatalf("Unable to convert port %v: %v", portName, err)
+		log.Fatalf("Unknown IP type: %v", *address)
 	}
 
 	// Create the stack with ip and tcp protocols, then add a tun-based
@@ -322,13 +323,13 @@ func main() {
 		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol},
 	})
 
-	mtu, err := rawfile.GetMTU(tunName)
+	mtu, err := rawfile.GetMTU(*device)
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	var fd int
-	fd, err = tun.Open(tunName)
+	fd, err = tun.Open(*device)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -374,10 +375,10 @@ func main() {
 
 	defer ep.Close()
 
-	if err := ep.Bind(tcpip.FullAddress{Port: uint16(localPort)}); err != nil {
+	if err := ep.Bind(tcpip.FullAddress{Port: uint16(*localPort)}); err != nil {
 		log.Fatal("Bind failed: ", err)
 	}
-	log.Printf("bound to %s:%d", addrWithPrefix, localPort)
+	log.Printf("bound to %s:%d", addrWithPrefix, *localPort)
 
 	if err := ep.Listen(10); err != nil {
 		log.Fatal("Listen failed: ", err)
